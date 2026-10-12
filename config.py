@@ -102,6 +102,14 @@ class Config:
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
+    # 首字等待窗口（秒）：发出消息后等 muse.ai 网页端吐第一个字的时限。
+    # 用于验证首字等待假设的初始默认值；应结合阶段耗时与排队表现评估是否保留。
+    first_token_timeout: int = field(
+        default_factory=lambda: int(_env("MUSE2API_FIRST_TOKEN_TIMEOUT", "90")))
+    # 首字前判定"VM 卡死"的宽限（秒）：页面仍显示 Still sending / Connecting... 时才放弃。
+    # 保留原 14s 行为；该 UI 文本判断不等同于确认 VM 状态。
+    vm_stuck_grace: int = field(
+        default_factory=lambda: int(_env("MUSE2API_VM_STUCK_GRACE", "14")))
 
     # 工具调用（function calling）协议适配开关，**默认关闭**。
     # 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"（原话：「我不会按这种 JSON

@@ -867,28 +867,42 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
+                    stop_event=None, request_deadline: float | None = None,
+                    request_id: str | None = None, attempt: int | None = None):
         """发一条消息，流式 yield 增量文本。"""
+        request_started = time.monotonic()
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
+        page_ready_at = time.monotonic()
+        log.info("chat phase request_id=%s attempt=%s phase=page_ready elapsed_s=%.3f",
+                 request_id or "-", attempt or "-", page_ready_at - request_started)
+        if request_deadline is not None and time.monotonic() >= request_deadline:
+            raise MuseGenerationError("对话请求总等待时限已到（页面准备后）")
         self.reset_thread(for_chat=True)
+        if request_deadline is not None and time.monotonic() >= request_deadline:
+            raise MuseGenerationError("对话请求总等待时限已到（会话重置后）")
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
+        if request_deadline is not None and time.monotonic() >= request_deadline:
+            raise MuseGenerationError("对话请求总等待时限已到（发送消息后）")
 
-        t_sent = time.time()
-        deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
+        t_sent = time.monotonic()
+        log.info("chat phase request_id=%s attempt=%s phase=prompt_sent elapsed_s=%.3f",
+                 request_id or "-", attempt or "-", t_sent - request_started)
+        deadline = min(t_sent + timeout, request_deadline) if request_deadline is not None else t_sent + timeout
+        first_token_deadline = min(
+            deadline, t_sent + float(getattr(self.cfg, "first_token_timeout", 90)))
         sent, last, stable = "", None, 0
         got_first = False
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
+        while time.monotonic() < first_token_deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
             if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
+                if time.monotonic() - t_sent > float(getattr(self.cfg, "vm_stuck_grace", 14)):
                     try:
                         tail = self.page.js("document.body.innerText.slice(-500)") or ""
                     except Exception:
@@ -900,16 +914,20 @@ class MuseEngine:
             delta = cur[len(sent):] if cur.startswith(sent) else cur
             if delta:
                 sent = cur
+                log.info("chat phase request_id=%s attempt=%s phase=first_delta elapsed_s=%.3f",
+                         request_id or "-", attempt or "-", time.monotonic() - t_sent)
                 yield delta
                 last = cur
                 got_first = True
                 break
 
         if not got_first:
+            log.warning("chat phase request_id=%s attempt=%s phase=first_delta_timeout elapsed_s=%.3f",
+                        request_id or "-", attempt or "-", time.monotonic() - t_sent)
             raise MuseGenerationError("等待助手首字响应超时")
 
         # 2. 持续捕获增量文本
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.06)
@@ -927,11 +945,17 @@ class MuseEngine:
                 stable += 1
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
                 if not has_stop and stable >= 3:
+                    log.info("chat phase request_id=%s attempt=%s phase=completed elapsed_s=%.3f",
+                             request_id or "-", attempt or "-", time.monotonic() - t_sent)
                     return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
                 if has_stop and stable >= 80:
+                    log.info("chat phase request_id=%s attempt=%s phase=stable_stop elapsed_s=%.3f",
+                             request_id or "-", attempt or "-", time.monotonic() - t_sent)
                     return
 
+        log.warning("chat phase request_id=%s attempt=%s phase=generation_timeout elapsed_s=%.3f",
+                    request_id or "-", attempt or "-", time.monotonic() - t_sent)
         raise MuseGenerationError("等待助手回复超时")
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,

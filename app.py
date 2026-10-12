@@ -213,13 +213,35 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     request_id: str | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
-    无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
+    单个 deadline 覆盖锁等待与最多两次生成尝试；断连时停止向满队列阻塞投递。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
+    deadline = time.monotonic() + max(1, timeout)
+    request_id = request_id or uuid.uuid4().hex[:16]
+
+    def put_or_stop(item) -> bool:
+        while not stop_event.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def acquire_lock_or_stop() -> bool:
+        """Poll the browser lock so a disconnected client can cancel queued work."""
+        while not stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if GEN_LOCK.acquire(timeout=min(0.2, remaining)):
+                return True
+        return False
 
     def worker():
         cur_id = account_id
@@ -228,8 +250,14 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         last_exc = None
         try:
             for attempt in range(2):
+                attempt_started = time.monotonic()
+                stage = "account_or_renew"
                 if stop_event.is_set():
                     return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_exc = MuseGenerationError("对话请求总等待时限已到")
+                    break
                 if attempt > 0:
                     alt = store.pick_account(rotate=True, force_rotate=True, exclude_id=cur_id)
                     if not alt or alt["id"] == cur_id:
@@ -239,46 +267,74 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     cur_exp = alt.get("cookies_exp")
                     log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
                 yielded = False
+                first_chunk_logged = False
                 try:
+                    renew_started = time.monotonic()
                     if cur_id:
                         refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
-                    with GEN_LOCK:
+                    renew_elapsed = time.monotonic() - renew_started
+                    stage = "browser_queue"
+                    lock_wait_started = time.monotonic()
+                    if not acquire_lock_or_stop():
                         if stop_event.is_set():
                             return
+                        raise MuseGenerationError("等待浏览器队列超时")
+                    try:
+                        if stop_event.is_set():
+                            return
+                        lock_wait = time.monotonic() - lock_wait_started
+                        stage = "page_and_generation"
                         engine.start()
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise MuseGenerationError("对话请求总等待时限已到")
                         for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
+                            cur_cookies, prompt, cur_exp, remaining,
+                            account_id=cur_id, stop_event=stop_event,
+                            request_deadline=deadline, request_id=request_id,
+                            attempt=attempt + 1
                         ):
                             yielded = True
-                            q.put(("data", chunk))
-                            if stop_event.is_set():
+                            if not first_chunk_logged:
+                                log.info(
+                                    "chat attempt request_id=%s attempt=%s renew_s=%.3f lock_wait_s=%.3f first_delta_s=%.3f",
+                                    request_id, attempt + 1, renew_elapsed, lock_wait,
+                                    time.monotonic() - attempt_started,
+                                )
+                                first_chunk_logged = True
+                            if not put_or_stop(("data", chunk)):
                                 return
+                    finally:
+                        GEN_LOCK.release()
+                    if stop_event.is_set():
+                        return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
+                    log.info("chat attempt completed request_id=%s attempt=%s elapsed_s=%.3f", request_id, attempt + 1, time.monotonic() - attempt_started)
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
+                    log.warning("chat attempt failed request_id=%s attempt=%s stage=%s elapsed_s=%.3f error_type=%s", request_id, attempt + 1, stage, time.monotonic() - attempt_started, type(exc).__name__)
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
                     if yielded:
                         break
                 except Exception as exc:
                     last_exc = exc
-                    try:
-                        engine.reset_thread()
-                    except Exception:
-                        pass
+                    log.warning("chat attempt failed request_id=%s attempt=%s stage=%s elapsed_s=%.3f error_type=%s", request_id, attempt + 1, stage, time.monotonic() - attempt_started, type(exc).__name__)
                     if yielded:
                         break
             if last_exc is not None:
-                q.put(("error", last_exc))
+                put_or_stop(("error", last_exc))
+        except Exception as exc:
+            # 包括账号选择等内层 try 之外的异常，不能被伪装成空成功。
+            put_or_stop(("error", exc))
         finally:
-            q.put(("done", None))
+            put_or_stop(("done", None))
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1361,7 +1417,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                for chunk in safe_chat_stream(cookies, prompt, expires, timeout,
+                                              account_id=acc_id, request_id=rid):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1379,10 +1436,36 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "type": "response.completed",
                     "response": envelope("completed", full)})
             except Exception as exc:  # noqa: BLE001
-                log.warning("responses 流式失败: %s", exc)
+                log.warning("responses 流式失败 request_id=%s: %s", rid, exc)
+                failed = envelope("failed")
+                failed["output"] = []
+                if isinstance(exc, MuseAuthError):
+                    error_code = "auth_error"
+                    public_message = "账号会话认证失败，请检查账号状态。"
+                elif isinstance(exc, MuseGenerationError):
+                    reason = str(exc)
+                    known_failures = (
+                        ("等待助手首字响应超时", "first_token_timeout"),
+                        ("云端 VM 连接超时 (Still sending)", "vm_connection_timeout"),
+                        ("等待浏览器队列超时", "browser_queue_timeout"),
+                    )
+                    match = next(((message, code) for message, code in known_failures
+                                  if reason == message), None)
+                    if reason.startswith("对话请求总等待时限已到"):
+                        match = ("对话请求总等待时限已到", "request_deadline_exceeded")
+                    error_code = match[1] if match else "upstream_error"
+                    public_message = (match[0] if match else
+                                      "上游生成失败或超时，请稍后重试。")
+                else:
+                    error_code = "server_error"
+                    public_message = "内部服务器错误，请联系管理员。"
+                failed["error"] = {
+                    "code": error_code,
+                    "message": public_message,
+                }
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
-                    "response": envelope("failed")})
+                    "response": failed})
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
@@ -1424,6 +1507,9 @@ def admin_status(_=Depends(auth)):
         "config": {"site": CFG.site_url, "cdp_port": CFG.cdp_port,
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
+                   "chat_timeout": CFG.chat_timeout,
+                   "first_token_timeout": CFG.first_token_timeout,
+                   "vm_stuck_grace": CFG.vm_stuck_grace,
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
     }
